@@ -1,23 +1,16 @@
-"""
-需求影响分析服务 — FastAPI 应用
+"""需求影响分析服务：FastAPI + OpenAI Codex Python SDK。"""
 
-暴露 REST 接口，接收产品文档 URL + 原型图地址，
-调用 Qoder Agent SDK + requirement-impact-analysis skill
-对指定项目代码进行影响范围分析。
-
-启动方式:
-    python app.py
-
-环境变量:
-    QODER_PERSONAL_ACCESS_TOKEN  — Qoder PAT（可选，未设置时自动使用本地 qodercli 登录态）
-"""
+from __future__ import annotations
 
 import ast
 import json
 import os
 import re
+import subprocess
 import tempfile
 import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,59 +18,50 @@ from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
-from analyzer import (
-    AnalysisConfig,
-    run_analysis,
-    stream_analysis,
-)
+from analyzer import DEFAULT_MODEL, AnalysisConfig, run_analysis, stream_analysis
 
-# ── Pydantic 模型 ─────────────────────────────────────────
+
+REQUIRED_PROJECT_BRANCH = "dev"
 
 
 class AnalyzeRequest(BaseModel):
-    """分析请求体。"""
+    """影响范围分析请求。"""
 
-    prd_url: str = Field(..., description="产品文档 / 需求地址 URL")
-    prototype_image: str | None = Field(default=None, description="原型图：本地绝对路径或 http/https URL（可选，URL 自动下载）")
-    project_path: str = Field(..., description="待分析代码项目根目录（绝对路径）")
+    requirement_html_path: str = Field(..., description="本地需求产品文档 HTML 绝对路径")
+    prototype_image: str | None = Field(
+        default=None,
+        description="原型图本地绝对路径或 http/https URL；URL 会先下载到临时文件",
+    )
+    project_path: str = Field(
+        ...,
+        description="待分析本地 Git 仓库绝对路径；仓库当前分支必须为 dev",
+    )
     skill_name: str = Field(
-        default="requirement-impact-analysis",
-        description="要调用的 skill 名称",
+        default="requirement-impact-analyzer",
+        description="Codex skill 名称",
     )
     skill_path: str | None = Field(
         default=None,
-        description="自定义 skill 目录路径（可选，默认使用用户级 skill）",
+        description="SKILL.md 或 skill 目录绝对路径；为空时使用 ~/.codex/skills/<skill_name>/SKILL.md",
     )
-    extra_context: str = Field(
-        default="",
-        description="额外项目上下文信息（技术栈/包结构/规范约束等）",
-    )
+    extra_context: str = Field(default="", description="额外项目背景，仅作为不可信分析证据")
     model: str | None = Field(
         default=None,
-        description="模型别名(sonnet/opus/haiku)或完整模型 ID，不传则用 CLI 默认模型",
+        description=f"Codex 模型 ID；为空时使用服务端固定模型 {DEFAULT_MODEL}",
     )
+    refresh_cache: bool = Field(default=False, description="是否忽略相同输入的已有分析缓存并重新分析")
 
 
 class AnalyzeResponse(BaseModel):
-    """分析完成响应体。"""
+    """同步分析响应，report 为精简的 Markdown 文件变更清单。"""
 
     success: bool
     report: str = ""
     error: str = ""
 
 
-# ── JSON 容错解析（对接口透明，不影响参数传递）───────────
-
-
 def _decode_json_lenient(text: str):
-    """
-    容错解析 JSON 文本：
-    1) 标准 JSON
-    2) 去除尾逗号后重试: {"a": 1,} → {"a": 1}
-    3) Python 字面量兜底（单引号等）: {'a': 1} → {"a": 1}
-
-    注意：Windows 路径反斜杠仍需在 JSON 中双写转义（\\）或改用正斜杠（/）。
-    """
+    """兼容标准 JSON、尾逗号和 Python 字典字面量。"""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -99,16 +83,14 @@ def _decode_json_lenient(text: str):
     raise HTTPException(
         status_code=400,
         detail=(
-            "请求体不是合法 JSON。请检查："
-            "1) 属性名和字符串必须使用双引号；"
-            "2) Windows 路径反斜杠需双写转义(\\\\)或改用正斜杠(/)；"
-            "3) 不要有尾逗号。"
+            "请求体不是合法 JSON。属性名/字符串请使用双引号；Windows 路径中的反斜杠"
+            "需双写转义(\\\\)，或直接使用正斜杠(/)。"
         ),
     )
 
 
 class TolerantRequest(Request):
-    """请求类：重写 json() 实现容错解析，其余行为与标准 Request 一致。"""
+    """为现有接口保留宽松 JSON 解析行为。"""
 
     async def json(self):
         raw = await self.body()
@@ -119,7 +101,7 @@ class TolerantRequest(Request):
 
 
 class TolerantRoute(APIRoute):
-    """路由类：把请求对象替换为 TolerantRequest，接口签名保持 Pydantic 模型不变。"""
+    """将默认 Request 替换为 TolerantRequest。"""
 
     def get_route_handler(self):
         original = super().get_route_handler()
@@ -131,162 +113,202 @@ class TolerantRoute(APIRoute):
         return custom_route_handler
 
 
-# ── FastAPI 应用 ───────────────────────────────────────────
-
 app = FastAPI(
     title="需求影响分析服务",
-    description="基于 Qoder Agent SDK，接收产品文档和原型图，分析代码影响范围",
-    version="1.0.0",
+    description="通过 OpenAI Codex Python SDK 和 requirement-impact-analyzer skill 分析代码影响范围",
+    version="2.1.0",
 )
-
-# 所有路由启用 JSON 容错解析（接口签名/参数不受影响）
 app.router.route_class = TolerantRoute
 
 
 @app.get("/health")
 async def health():
-    """健康检查。"""
-    return {"status": "ok"}
+    return {"status": "ok", "engine": "openai-codex", "default_model": DEFAULT_MODEL}
+
+
+@dataclass(slots=True)
+class ResolvedPrototype:
+    path: str | None
+    temporary: bool = False
+
+    def cleanup(self) -> None:
+        if self.temporary and self.path:
+            try:
+                Path(self.path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _run_git(project: Path, *args: str) -> str:
+    """只读执行本地 Git 查询并返回标准输出。"""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail="服务器未安装 Git 或 Git 不在 PATH 中") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=400, detail=f"读取本地 Git 仓库超时: {project}") from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "未知 Git 错误"
+        raise HTTPException(status_code=400, detail=f"无法读取本地 Git 仓库 {project}: {detail}")
+    return result.stdout.strip()
+
+
+def _resolve_local_dev_repository(project: Path) -> Path:
+    """解析本地仓库根目录，并强制当前分支为 dev。"""
+    repository = Path(_run_git(project, "rev-parse", "--show-toplevel")).resolve()
+    branch = _run_git(repository, "branch", "--show-current")
+    if branch != REQUIRED_PROJECT_BRANCH:
+        current = branch or "detached HEAD"
+        raise HTTPException(
+            status_code=400,
+            detail=f"project_path 当前必须位于本地 dev 分支，实际分支: {current}",
+        )
+    return repository
+
+
+def _validate_request(req: AnalyzeRequest) -> tuple[str, str]:
+    """校验需求 HTML，并将项目限制为本地 dev 分支仓库。"""
+    requirement = Path(req.requirement_html_path).expanduser()
+    if not requirement.is_absolute():
+        raise HTTPException(status_code=400, detail="requirement_html_path 必须是绝对路径")
+    requirement = requirement.resolve()
+    if not requirement.is_file():
+        raise HTTPException(status_code=400, detail=f"需求 HTML 不存在: {requirement}")
+    if requirement.suffix.lower() not in {".html", ".htm"}:
+        raise HTTPException(status_code=400, detail="requirement_html_path 必须指向 .html 或 .htm 文件")
+
+    project = Path(req.project_path).expanduser()
+    if not project.is_absolute():
+        raise HTTPException(status_code=400, detail="project_path 必须是绝对路径")
+    project = project.resolve()
+    if not project.is_dir():
+        raise HTTPException(status_code=400, detail=f"项目路径不存在或不是目录: {project}")
+    project = _resolve_local_dev_repository(project)
+    return str(requirement), str(project)
+
+
+def _resolve_prototype_image(prototype_image: str | None) -> ResolvedPrototype:
+    """将本地路径或 URL 解析为 Codex 可读取的本地图片。"""
+    if not prototype_image:
+        return ResolvedPrototype(None)
+
+    if prototype_image.startswith(("http://", "https://")):
+        suffix = Path(urlparse(prototype_image).path).suffix or ".png"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.close()
+        try:
+            request = urllib.request.Request(prototype_image, headers={"User-Agent": "codex-impact-analyzer/2.0"})
+            with urllib.request.urlopen(request, timeout=30) as response, open(tmp.name, "wb") as output:
+                remaining = 20 * 1024 * 1024
+                while chunk := response.read(min(1024 * 1024, remaining + 1)):
+                    remaining -= len(chunk)
+                    if remaining < 0:
+                        raise ValueError("原型图超过 20 MiB 限制")
+                    output.write(chunk)
+        except Exception as exc:
+            Path(tmp.name).unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"下载原型图失败: {exc}") from exc
+        return ResolvedPrototype(tmp.name, temporary=True)
+
+    prototype = Path(prototype_image).expanduser()
+    if not prototype.is_absolute():
+        raise HTTPException(status_code=400, detail="prototype_image 必须是绝对路径或 http/https URL")
+    prototype = prototype.resolve()
+    if not prototype.is_file():
+        raise HTTPException(status_code=400, detail=f"原型图文件不存在: {prototype}")
+    return ResolvedPrototype(str(prototype))
+
+
+def _build_config(req: AnalyzeRequest, prototype_path: str | None) -> AnalysisConfig:
+    requirement, project = _validate_request(req)
+    return AnalysisConfig(
+        requirement_html_path=requirement,
+        prototype_image=prototype_path,
+        project_path=project,
+        skill_name=req.skill_name,
+        skill_path=req.skill_path,
+        extra_context=req.extra_context,
+        model=req.model or DEFAULT_MODEL,
+        refresh_cache=req.refresh_cache,
+    )
 
 
 @app.post("/api/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
-    """
-    同步分析接口：阻塞等待分析完成后返回完整报告。
-
-    适合一次性获取结果，不适合实时展示进度。
-    请求体 JSON 解析做了容错处理：支持单引号、尾逗号等常见格式问题。
-    """
-    _validate_request(req)
-
-    config = AnalysisConfig(
-        prd_url=req.prd_url,
-        prototype_image=_resolve_prototype_image(req.prototype_image),
-        project_path=req.project_path,
-        skill_name=req.skill_name,
-        skill_path=req.skill_path,
-        extra_context=req.extra_context,
-        model=req.model,
-    )
-
+    """执行只读分析，等待 Codex 返回精简的 Markdown 文件变更清单。"""
+    resolved = _resolve_prototype_image(req.prototype_image)
     try:
+        config = _build_config(req, resolved.path)
         report = await run_analysis(config)
         return AnalyzeResponse(success=True, report=report)
-    except Exception as e:
-        return AnalyzeResponse(success=False, error=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return AnalyzeResponse(success=False, error=str(exc))
+    finally:
+        resolved.cleanup()
 
 
 @app.get("/api/analyze/stream")
 async def analyze_stream(
-    prd_url: str,
+    requirement_html_path: str,
     project_path: str,
     prototype_image: str | None = None,
-    skill_name: str = "requirement-impact-analysis",
+    skill_name: str = "requirement-impact-analyzer",
     skill_path: str | None = None,
     extra_context: str = "",
     model: str | None = None,
+    refresh_cache: bool = False,
 ):
-    """
-    流式分析接口（SSE）：实时推送分析进度。
-
-    参数通过 query string 传递，返回 text/event-stream。
-    每条事件格式: data: {json}\\n\\n
-    """
-
-    config = AnalysisConfig(
-        prd_url=prd_url,
-        prototype_image=_resolve_prototype_image(prototype_image),
+    """以 SSE 推送启动状态以及最终文件变更清单。"""
+    req = AnalyzeRequest(
+        requirement_html_path=requirement_html_path,
         project_path=project_path,
+        prototype_image=prototype_image,
         skill_name=skill_name,
         skill_path=skill_path,
         extra_context=extra_context,
         model=model,
+        refresh_cache=refresh_cache,
+    )
+    requirement, project = _validate_request(req)
+    resolved = _resolve_prototype_image(prototype_image)
+    config = AnalysisConfig(
+        requirement_html_path=requirement,
+        project_path=project,
+        prototype_image=resolved.path,
+        skill_name=skill_name,
+        skill_path=skill_path,
+        extra_context=extra_context,
+        model=model or DEFAULT_MODEL,
+        refresh_cache=refresh_cache,
     )
 
     async def event_stream():
         try:
             async for event in stream_analysis(config):
-                data = {
-                    "type": event.event_type,
-                    "content": event.content,
-                    "metadata": event.metadata,
-                }
+                data = {"type": event.event_type, "content": event.content, "metadata": event.metadata}
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-        except Exception as e:
-            error_data = {
-                "type": "error",
-                "content": f"分析失败: {e}",
-                "metadata": {},
-            }
-            yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+        finally:
+            resolved.cleanup()
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
-
-# ── 校验 ──────────────────────────────────────────────────
-
-
-def _validate_request(req: AnalyzeRequest) -> None:
-    """请求参数校验。"""
-    if not req.prd_url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="prd_url 必须是 http/https URL")
-
-    if not os.path.isabs(req.project_path):
-        raise HTTPException(
-            status_code=400,
-            detail="project_path 必须是绝对路径",
-        )
-    if not os.path.isdir(req.project_path):
-        raise HTTPException(
-            status_code=400,
-            detail=f"项目路径不存在或不是目录: {req.project_path}",
-        )
-
-
-def _resolve_prototype_image(prototype_image: str | None) -> str | None:
-    """解析原型图为本地文件路径：支持 URL（自动下载到临时文件）和本地绝对路径。"""
-    if not prototype_image:
-        return None
-
-    # URL：下载到临时文件
-    if prototype_image.startswith(("http://", "https://")):
-        suffix = os.path.splitext(urlparse(prototype_image).path)[1] or ".png"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tmp.close()
-        try:
-            urllib.request.urlretrieve(prototype_image, tmp.name)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"下载原型图失败: {e}")
-        return tmp.name
-
-    # 本地路径：校验绝对路径 + 存在
-    if not os.path.isabs(prototype_image):
-        raise HTTPException(
-            status_code=400,
-            detail="prototype_image 必须是绝对路径或 http/https URL",
-        )
-    if not os.path.exists(prototype_image):
-        raise HTTPException(
-            status_code=400,
-            detail=f"原型图文件不存在: {prototype_image}",
-        )
-    return prototype_image
-
-
-# ── 启动 ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("PORT", "9000"))
-    # 注意：Windows 下不开 reload。reload 的父子进程 socket 继承会导致
-    # accept 失效（请求挂起）；SDK 子进程问题已由 analyzer 线程桥接解决。
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), reload=False)

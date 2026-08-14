@@ -1,4 +1,4 @@
-qoder-agent-sdk>=0.1.0
+openai-codex>=0.144.4
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.0.0
