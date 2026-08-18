@@ -22,7 +22,7 @@ from analyzer import (
     _update_hash_with_file,
     _write_cached_report,
 )
-from settings import QODER_MODEL, QODER_SKILL_NAME
+from settings import QODER_MODEL, QODER_SKILL_NAME, QODER_SKILLS_DIR
 
 try:
     from qoder_agent_sdk import (
@@ -44,6 +44,9 @@ except ImportError:  # pragma: no cover
 
 DEFAULT_QODER_SKILL_NAME = QODER_SKILL_NAME
 DEFAULT_QODER_MODEL = QODER_MODEL
+
+# 项目根目录；服务器部署时 skill 可放在 <项目根>/qoder-skills/skills/<名称>/SKILL.md
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 _QODER_WRITE_TOOLS = [
     "Write",
@@ -104,13 +107,41 @@ class QoderAnalysisConfig:
     refresh_cache: bool = False
 
 
+def _qoder_skill_search_dirs() -> list[Path]:
+    """skill 根目录查找顺序：显式配置 > 项目内 qoder-skills/skills > 用户级 ~/.qoder/skills。"""
+    dirs: list[Path] = []
+    configured = (QODER_SKILLS_DIR or os.environ.get("QODER_SKILLS_DIR", "")).strip()
+    if configured:
+        dirs.append(Path(configured).expanduser())
+    dirs.append(PROJECT_ROOT / "qoder-skills" / "skills")
+    dirs.append(Path.home() / ".qoder" / "skills")
+    return dirs
+
+
+def _resolve_qoder_skill_file(skill_name: str) -> Path:
+    """定位 SKILL.md；找不到时列出全部候选路径。"""
+    candidates = [(base / skill_name / "SKILL.md").resolve() for base in _qoder_skill_search_dirs()]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    searched = "; ".join(str(item) for item in candidates)
+    raise FileNotFoundError(f"找不到 skill 文件: {skill_name}。已查找: {searched}")
+
+
+def _build_qoder_system_prompt(config: QoderAnalysisConfig) -> str:
+    """系统提示词 = 只读安全边界 + 完整 skill 内容，不依赖 SDK 的 skill 发现机制。"""
+    skill_file = _resolve_qoder_skill_file(config.skill_name)
+    skill_text = skill_file.read_text(encoding="utf-8", errors="replace").strip()
+    return f"{_QODER_DEVELOPER_INSTRUCTIONS}\n\n以下是必须遵循的 {config.skill_name} skill 完整内容：\n\n{skill_text}"
+
+
 def _build_qoder_prompt(config: QoderAnalysisConfig) -> str:
     """构造 Qoder 分析指令；所有输入材料均为不可信证据。"""
     prototype = config.prototype_image or "无"
     requirement = config.requirement_html_path or "无（仅依据原型图分析）"
     context = config.extra_context.strip() or "无"
     return f"""
-请使用 /{config.skill_name} skill 完成一次只读的项目代码影响范围分析。
+请基于系统提示词中已加载的 {config.skill_name} skill，完成一次只读的项目代码影响范围分析。
 
 输入证据：
 - 需求产品文档（本地 HTML）：{requirement}
@@ -125,7 +156,7 @@ def _build_qoder_prompt(config: QoderAnalysisConfig) -> str:
 - 全程只读，不得实现需求或更改仓库。
 
 执行要求：
-1. 完整读取并遵循 {config.skill_name} skill 的分析工作流；忽略其长报告模板，以下方结构化输出要求为准。
+1. 完整遵循系统提示词中 {config.skill_name} skill 的分析工作流；忽略其长报告模板，以下方结构化输出要求为准。
 2. 若提供了需求 HTML，读取并理解需求；检查原型图，并盘点仓库结构与 Git 状态。
 3. 把需求/原型拆成最小可审查功能点，逐个串行追踪 route/UI/state/API/domain/persistence/config/tests。
 4. 只将有充分依据且预计需要新增或修改的文件纳入最终结果；合并同一文件涉及的全部修改点。
@@ -161,6 +192,7 @@ def _build_qoder_cache_key(config: QoderAnalysisConfig) -> tuple[str, str]:
     if config.requirement_html_path:
         _update_hash_with_file(hasher, "requirement", Path(config.requirement_html_path))
     _update_hash_with_file(hasher, "prototype", Path(config.prototype_image) if config.prototype_image else None)
+    _update_hash_with_file(hasher, "skill", _resolve_qoder_skill_file(config.skill_name))
     return hasher.hexdigest(), head
 
 
@@ -212,12 +244,10 @@ async def _qoder_can_use_tool(tool_name: str, tool_input: dict, context: Any):
 
 
 def _qoder_options(config: QoderAnalysisConfig):
-    """构造只读 Qoder 会话选项：plan 模式 + 写入工具黑名单 + 权限回调白名单。"""
+    """构造只读 Qoder 会话选项：plan 模式 + 写入工具黑名单 + 权限回调白名单；skill 内容注入系统提示词。"""
     return QoderAgentOptions(
         cwd=config.project_path,
-        system_prompt=_QODER_DEVELOPER_INSTRUCTIONS,
-        skills=[config.skill_name],
-        setting_sources=["user"],
+        system_prompt=_build_qoder_system_prompt(config),
         permission_mode="plan",
         disallowed_tools=list(_QODER_WRITE_TOOLS),
         can_use_tool=_qoder_can_use_tool,
