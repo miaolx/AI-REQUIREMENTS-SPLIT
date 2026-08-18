@@ -18,6 +18,13 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 from analyzer import DEFAULT_MODEL, AnalysisConfig, run_analysis, stream_analysis
+from qoder_analyzer import (
+    DEFAULT_QODER_MODEL,
+    DEFAULT_QODER_SKILL_NAME,
+    QoderAnalysisConfig,
+    run_qoder_analysis,
+    stream_qoder_analysis,
+)
 from settings import PORT
 
 
@@ -58,6 +65,33 @@ class AnalyzeResponse(BaseModel):
     success: bool
     report: str = ""
     error: str = ""
+
+
+class QoderAnalyzeRequest(BaseModel):
+    """Qoder 引擎影响范围分析请求。"""
+
+    prototype_image: str | None = Field(
+        default=None,
+        description="原型图本地绝对路径或 http/https URL；URL 会先下载到临时文件；可为空（仅依据需求文档分析）",
+    )
+    project_path: str = Field(
+        ...,
+        description="待分析本地 Git 仓库绝对路径；仓库当前分支必须为 dev",
+    )
+    requirement_html_path: str | None = Field(
+        default=None,
+        description="可选：本地需求产品文档 HTML 绝对路径",
+    )
+    skill_name: str = Field(
+        default=DEFAULT_QODER_SKILL_NAME,
+        description="Qoder skill 名称（位于 ~/.qoder/skills/<名称>）",
+    )
+    extra_context: str = Field(default="", description="额外项目背景，仅作为不可信分析证据")
+    model: str | None = Field(
+        default=None,
+        description="Qoder 模型 ID；为空时使用 Qoder 默认模型",
+    )
+    refresh_cache: bool = Field(default=False, description="是否忽略相同输入的已有分析缓存并重新分析")
 
 
 def _decode_json_lenient(text: str):
@@ -297,6 +331,102 @@ async def analyze_stream(
     async def event_stream():
         try:
             async for event in stream_analysis(config):
+                data = {"type": event.event_type, "content": event.content, "metadata": event.metadata}
+                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+        finally:
+            resolved.cleanup()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+def _validate_qoder_request(req: QoderAnalyzeRequest) -> tuple[str | None, str]:
+    """校验可选需求 HTML，并将项目限制为本地 dev 分支仓库。"""
+    requirement: str | None = None
+    if req.requirement_html_path:
+        candidate = Path(req.requirement_html_path).expanduser()
+        if not candidate.is_absolute():
+            raise HTTPException(status_code=400, detail="requirement_html_path 必须是绝对路径")
+        candidate = candidate.resolve()
+        if not candidate.is_file():
+            raise HTTPException(status_code=400, detail=f"需求 HTML 不存在: {candidate}")
+        if candidate.suffix.lower() not in {".html", ".htm"}:
+            raise HTTPException(status_code=400, detail="requirement_html_path 必须指向 .html 或 .htm 文件")
+        requirement = str(candidate)
+
+    project = Path(req.project_path).expanduser()
+    if not project.is_absolute():
+        raise HTTPException(status_code=400, detail="project_path 必须是绝对路径")
+    project = project.resolve()
+    if not project.is_dir():
+        raise HTTPException(status_code=400, detail=f"项目路径不存在或不是目录: {project}")
+    project = _resolve_local_dev_repository(project)
+    return requirement, str(project)
+
+
+@app.post("/api/analyze/qoder", response_model=AnalyzeResponse)
+async def analyze_qoder(req: QoderAnalyzeRequest) -> AnalyzeResponse:
+    """使用 Qoder + requirement-impact-analysis skill 分析原型图对应的代码变更影响范围。"""
+    resolved = _resolve_prototype_image(req.prototype_image)
+    try:
+        requirement, project = _validate_qoder_request(req)
+        config = QoderAnalysisConfig(
+            project_path=project,
+            prototype_image=resolved.path,
+            requirement_html_path=requirement,
+            skill_name=req.skill_name,
+            extra_context=req.extra_context,
+            model=req.model or DEFAULT_QODER_MODEL,
+            refresh_cache=req.refresh_cache,
+        )
+        report = await run_qoder_analysis(config)
+        return AnalyzeResponse(success=True, report=report)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return AnalyzeResponse(success=False, error=str(exc))
+    finally:
+        resolved.cleanup()
+
+
+@app.get("/api/analyze/qoder/stream")
+async def analyze_qoder_stream(
+    project_path: str,
+    prototype_image: str | None = None,
+    requirement_html_path: str | None = None,
+    skill_name: str = DEFAULT_QODER_SKILL_NAME,
+    extra_context: str = "",
+    model: str | None = None,
+    refresh_cache: bool = False,
+):
+    """以 SSE 推送 Qoder 分析过程文本及最终文件变更清单。"""
+    req = QoderAnalyzeRequest(
+        prototype_image=prototype_image,
+        project_path=project_path,
+        requirement_html_path=requirement_html_path,
+        skill_name=skill_name,
+        extra_context=extra_context,
+        model=model,
+        refresh_cache=refresh_cache,
+    )
+    requirement, project = _validate_qoder_request(req)
+    resolved = _resolve_prototype_image(prototype_image)
+    config = QoderAnalysisConfig(
+        project_path=project,
+        prototype_image=resolved.path,
+        requirement_html_path=requirement,
+        skill_name=skill_name,
+        extra_context=extra_context,
+        model=model or DEFAULT_QODER_MODEL,
+        refresh_cache=refresh_cache,
+    )
+
+    async def event_stream():
+        try:
+            async for event in stream_qoder_analysis(config):
                 data = {"type": event.event_type, "content": event.content, "metadata": event.metadata}
                 yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
         finally:
