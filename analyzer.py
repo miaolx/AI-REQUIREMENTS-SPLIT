@@ -23,15 +23,20 @@ from openai_codex import (
 )
 from openai_codex.types import ReasoningEffort
 
+from settings import (
+    ANALYSIS_CACHE_DIR,
+    CODEX_MODEL,
+    CODEX_REASONING_EFFORT,
+    OPENAI_API_KEY,
+)
+
 
 DEFAULT_SKILL_NAME = "requirement-impact-analyzer"
-DEFAULT_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
-DEFAULT_REASONING_EFFORT = os.environ.get("CODEX_REASONING_EFFORT", "high")
+DEFAULT_MODEL = CODEX_MODEL
+DEFAULT_REASONING_EFFORT = CODEX_REASONING_EFFORT
 CACHE_SCHEMA_VERSION = 1
 PROMPT_VERSION = "concise-impact-v2"
-CACHE_DIRECTORY = Path(
-    os.environ.get("ANALYSIS_CACHE_DIR", Path(__file__).resolve().parent / ".analysis-cache")
-).expanduser()
+CACHE_DIRECTORY = Path(ANALYSIS_CACHE_DIR).expanduser()
 
 _CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 
@@ -352,9 +357,9 @@ async def _execute_uncached_analysis(
 ) -> tuple[str, dict]:
     """启动一个临时只读 Codex thread，规范化结果并写入缓存。"""
     async with AsyncCodex() as codex:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if api_key:
-            await codex.login_api_key(api_key)
+        if not OPENAI_API_KEY:
+            raise RuntimeError("settings.py 中未配置 OPENAI_API_KEY")
+        await codex.login_api_key(OPENAI_API_KEY)
         thread = await codex.thread_start(
             cwd=config.project_path,
             developer_instructions=_DEVELOPER_INSTRUCTIONS,

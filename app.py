@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import json
-import os
 import re
 import subprocess
 import tempfile
@@ -19,6 +18,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 from analyzer import DEFAULT_MODEL, AnalysisConfig, run_analysis, stream_analysis
+from settings import PORT
 
 
 REQUIRED_PROJECT_BRANCH = "dev"
@@ -311,4 +311,4 @@ async def analyze_stream(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
