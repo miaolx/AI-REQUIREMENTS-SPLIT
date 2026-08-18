@@ -15,7 +15,8 @@ class LocalDevRepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory) / "repository"
             repository.mkdir()
-            subprocess.run(["git", "init", "-b", "dev", str(repository)], check=True, capture_output=True)
+            subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "dev"], cwd=repository, check=True, capture_output=True)
             nested = repository / "src" / "feature"
             nested.mkdir(parents=True)
 
@@ -27,7 +28,8 @@ class LocalDevRepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory) / "repository"
             repository.mkdir()
-            subprocess.run(["git", "init", "-b", "feature", str(repository)], check=True, capture_output=True)
+            subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "feature"], cwd=repository, check=True, capture_output=True)
 
             with self.assertRaises(HTTPException) as raised:
                 app._resolve_local_dev_repository(repository)

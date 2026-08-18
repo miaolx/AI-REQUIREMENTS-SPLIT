@@ -143,7 +143,8 @@ def _run_git(project: Path, *args: str) -> str:
     """只读执行本地 Git 查询并返回标准输出。"""
     try:
         result = subprocess.run(
-            ["git", "-C", str(project), *args],
+            ["git", *args],
+            cwd=project,
             check=False,
             capture_output=True,
             text=True,
@@ -165,7 +166,7 @@ def _run_git(project: Path, *args: str) -> str:
 def _resolve_local_dev_repository(project: Path) -> Path:
     """解析本地仓库根目录，并强制当前分支为 dev。"""
     repository = Path(_run_git(project, "rev-parse", "--show-toplevel")).resolve()
-    branch = _run_git(repository, "branch", "--show-current")
+    branch = _run_git(repository, "rev-parse", "--abbrev-ref", "HEAD")
     if branch != REQUIRED_PROJECT_BRANCH:
         current = branch or "detached HEAD"
         raise HTTPException(

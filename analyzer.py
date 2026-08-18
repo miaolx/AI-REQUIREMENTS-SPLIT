@@ -84,7 +84,7 @@ class AnalysisConfig:
     skill_name: str = DEFAULT_SKILL_NAME
     skill_path: str | None = None
     extra_context: str = ""
-    model: str = DEFAULT_MODEL
+    model: str | None = DEFAULT_MODEL
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     refresh_cache: bool = False
 
@@ -164,7 +164,8 @@ def _build_inputs(config: AnalysisConfig, skill_file: Path):
 def _run_git_bytes(project: Path, *args: str) -> bytes:
     """执行不会改变仓库状态的 Git 查询。"""
     result = subprocess.run(
-        ["git", "-C", str(project), *args],
+        ["git", *args],
+        cwd=project,
         check=False,
         capture_output=True,
         timeout=30,
@@ -357,9 +358,8 @@ async def _execute_uncached_analysis(
 ) -> tuple[str, dict]:
     """启动一个临时只读 Codex thread，规范化结果并写入缓存。"""
     async with AsyncCodex() as codex:
-        if not OPENAI_API_KEY:
-            raise RuntimeError("settings.py 中未配置 OPENAI_API_KEY")
-        await codex.login_api_key(OPENAI_API_KEY)
+        if OPENAI_API_KEY:
+            await codex.login_api_key(OPENAI_API_KEY)
         thread = await codex.thread_start(
             cwd=config.project_path,
             developer_instructions=_DEVELOPER_INSTRUCTIONS,

@@ -85,18 +85,21 @@ class AnalysisCacheTests(unittest.TestCase):
             root = Path(directory)
             project = root / "project"
             project.mkdir()
-            subprocess.run(["git", "init", "-b", "dev", str(project)], check=True, capture_output=True)
+            subprocess.run(["git", "init", str(project)], check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "dev"], cwd=project, check=True, capture_output=True)
             subprocess.run(
-                ["git", "-C", str(project), "config", "user.email", "test@example.com"],
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=project,
                 check=True,
             )
             subprocess.run(
-                ["git", "-C", str(project), "config", "user.name", "Test"],
+                ["git", "config", "user.name", "Test"],
+                cwd=project,
                 check=True,
             )
             (project / "tracked.txt").write_text("tracked\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(project), "add", "tracked.txt"], check=True)
-            subprocess.run(["git", "-C", str(project), "commit", "-m", "initial"], check=True, capture_output=True)
+            subprocess.run(["git", "add", "tracked.txt"], cwd=project, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=project, check=True, capture_output=True)
 
             requirement = root / "requirement.html"
             requirement.write_text("<p>requirement</p>", encoding="utf-8")

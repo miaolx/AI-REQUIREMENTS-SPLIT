@@ -4,7 +4,8 @@ from pathlib import Path
 
 
 OPENAI_API_KEY = ""
-CODEX_MODEL = "gpt-5.4-mini"
-CODEX_REASONING_EFFORT = "high"
+# 免费 ChatGPT 账号由 Codex 自动选择当前可用模型。
+CODEX_MODEL: str | None = None
+CODEX_REASONING_EFFORT = "low"
 ANALYSIS_CACHE_DIR = Path(__file__).resolve().parent / ".analysis-cache"
 PORT = 8000
