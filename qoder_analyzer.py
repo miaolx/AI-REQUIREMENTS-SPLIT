@@ -48,6 +48,18 @@ DEFAULT_QODER_MODEL = QODER_MODEL
 # 项目根目录；服务器部署时 skill 可放在 <项目根>/qoder-skills/skills/<名称>/SKILL.md
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+# 网络超时等瞬时错误的自动重试次数
+QODER_MAX_RETRIES = 2
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """判断是否为可重试的瞬时错误（超时/连接中断）。"""
+    text = str(exc).lower()
+    return any(
+        keyword in text
+        for keyword in ("timeout", "timed out", "connection", "temporary", "unavailable", "reset")
+    )
+
 _QODER_WRITE_TOOLS = [
     "Write",
     "Edit",
@@ -253,6 +265,8 @@ def _qoder_options(config: QoderAnalysisConfig):
         can_use_tool=_qoder_can_use_tool,
         model=config.model,
         auth=_qoder_auth(),
+        # 首次启动 qodercli 及网络波动场景，放宽控制请求超时（默认 60s）
+        control_request_timeout_ms=300000,
     )
 
 
@@ -335,13 +349,27 @@ async def _execute_qoder_analysis(config: QoderAnalysisConfig) -> tuple[str, dic
                 return payload
         result_message = None
         assistant_texts: list[str] = []
-        async for message in qoder_query(prompt=_build_qoder_prompt(config), options=_qoder_options(config)):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        assistant_texts.append(block.text)
-            elif isinstance(message, ResultMessage):
-                result_message = message
+        last_exc: Exception | None = None
+        for attempt in range(QODER_MAX_RETRIES + 1):
+            result_message = None
+            assistant_texts = []
+            try:
+                async for message in qoder_query(prompt=_build_qoder_prompt(config), options=_qoder_options(config)):
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock) and block.text.strip():
+                                assistant_texts.append(block.text)
+                    elif isinstance(message, ResultMessage):
+                        result_message = message
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < QODER_MAX_RETRIES and _is_retryable_error(exc):
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
         if result_message is None:
             raise RuntimeError("Qoder 会话未返回结果消息")
         return _finish_qoder_result(result_message, config, cache_key, repository_head, assistant_texts)
@@ -366,14 +394,33 @@ async def stream_qoder_analysis(config: QoderAnalysisConfig) -> AsyncGenerator[A
 
         result_message = None
         assistant_texts: list[str] = []
-        async for message in qoder_query(prompt=_build_qoder_prompt(config), options=_qoder_options(config)):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        assistant_texts.append(block.text)
-                        yield AnalysisEvent("text", block.text, {"model": message.model})
-            elif isinstance(message, ResultMessage):
-                result_message = message
+        last_exc: Exception | None = None
+        for attempt in range(QODER_MAX_RETRIES + 1):
+            result_message = None
+            assistant_texts = []
+            try:
+                async for message in qoder_query(prompt=_build_qoder_prompt(config), options=_qoder_options(config)):
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock) and block.text.strip():
+                                assistant_texts.append(block.text)
+                                yield AnalysisEvent("text", block.text, {"model": message.model})
+                    elif isinstance(message, ResultMessage):
+                        result_message = message
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt < QODER_MAX_RETRIES and _is_retryable_error(exc):
+                    yield AnalysisEvent(
+                        "system",
+                        f"第 {attempt + 1} 次请求超时/失败，自动重试：{exc}",
+                        {"attempt": attempt + 1},
+                    )
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
         if result_message is None:
             raise RuntimeError("Qoder 会话未返回结果消息")
         report, metadata = _finish_qoder_result(result_message, config, cache_key, repository_head, assistant_texts)
