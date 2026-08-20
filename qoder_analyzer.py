@@ -8,6 +8,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -22,7 +23,7 @@ from analyzer import (
     _update_hash_with_file,
     _write_cached_report,
 )
-from settings import QODER_MODEL, QODER_SKILL_NAME, QODER_SKILLS_DIR
+from settings import QODER_MODEL, QODER_PERSONAL_ACCESS_TOKEN, QODER_SKILL_NAME, QODER_SKILLS_DIR
 
 try:
     from qoder_agent_sdk import (
@@ -33,7 +34,7 @@ try:
         QoderCLIAuthOptions,
         ResultMessage,
         TextBlock,
-        access_token_from_env,
+        access_token,
         query as qoder_query,
     )
 
@@ -168,7 +169,7 @@ def _build_qoder_prompt(config: QoderAnalysisConfig) -> str:
 请基于系统提示词中已加载的 {config.skill_name} skill，完成一次只读的项目代码影响范围分析。
 
 输入证据：
-- 需求产品文档（本地 HTML）：{requirement}
+- 需求产品文档（本地 HTML/Markdown）：{requirement}
 - 原型图（本地图片，请用文件读取工具直接打开查看）：{prototype}
 - 待分析仓库：{config.project_path}（已由服务端校验为本地 dev 分支）
 - 额外上下文：{context}
@@ -181,7 +182,7 @@ def _build_qoder_prompt(config: QoderAnalysisConfig) -> str:
 
 执行要求：
 1. 完整遵循系统提示词中 {config.skill_name} skill 的分析工作流；忽略其长报告模板，以下方结构化输出要求为准。
-2. 若提供了需求 HTML，读取并理解需求；检查原型图，并盘点仓库结构与 Git 状态。
+2. 若提供了需求文档，读取并理解需求；检查原型图，并盘点仓库结构与 Git 状态。
 3. 把需求/原型拆成最小可审查功能点，逐个串行追踪 route/UI/state/API/domain/persistence/config/tests。
 4. 只将有充分依据且预计需要新增或修改的文件纳入最终结果；合并同一文件涉及的全部修改点。
 5. 不要列出无需修改、仅回归测试、无法定位到具体路径或纯属猜测的文件。
@@ -250,9 +251,10 @@ def _extract_qoder_json(text: str) -> str:
 
 
 def _qoder_auth():
-    """优先使用 QODER_PERSONAL_ACCESS_TOKEN，未配置时回退本机 Qoder CLI 登录态。"""
-    if os.environ.get("QODER_PERSONAL_ACCESS_TOKEN"):
-        return access_token_from_env()
+    """优先用 settings.py 固定令牌/环境变量；未配置时回退本机 Qoder CLI 登录态。"""
+    token = (QODER_PERSONAL_ACCESS_TOKEN or "").strip()
+    if token:
+        return access_token(token)
     return QoderCLIAuthOptions()
 
 
@@ -405,21 +407,32 @@ async def stream_qoder_analysis(config: QoderAnalysisConfig) -> AsyncGenerator[A
     try:
         if not QODER_SDK_AVAILABLE:
             raise RuntimeError("未安装 qoder-agent-sdk，请先执行: pip install qoder-agent-sdk")
-        cache_key, repository_head = _build_qoder_cache_key(config)
-        if not config.refresh_cache:
-            payload = _qoder_cached_payload(config, cache_key, repository_head)
-            if payload is not None:
-                yield AnalysisEvent("result", payload[0], payload[1])
-                return
-
-        result_message = None
-        assistant_texts: list[str] = []
-        last_exc: Exception | None = None
         log_handle = QODER_CLI_STDERR_LOG.open("a", encoding="utf-8")
         try:
+            auth_desc = (
+                "access_token（settings.py 固定令牌/环境变量）"
+                if (QODER_PERSONAL_ACCESS_TOKEN or "").strip()
+                else "Qoder CLI 本机登录态（~/.qoder/.auth）"
+            )
+            log_handle.write(
+                f"===== {datetime.now():%Y-%m-%d %H:%M:%S} 启动 Qoder 分析，认证方式: {auth_desc} =====\n"
+            )
+            log_handle.flush()
+            cache_key, repository_head = _build_qoder_cache_key(config)
+            if not config.refresh_cache:
+                payload = _qoder_cached_payload(config, cache_key, repository_head)
+                if payload is not None:
+                    yield AnalysisEvent("result", payload[0], payload[1])
+                    return
+
+            result_message = None
+            assistant_texts: list[str] = []
+            last_exc: Exception | None = None
             for attempt in range(QODER_MAX_RETRIES + 1):
                 result_message = None
                 assistant_texts = []
+                log_handle.write(f"--- 第 {attempt + 1} 次尝试，调用 qodercli ---\n")
+                log_handle.flush()
                 try:
                     async for message in qoder_query(
                         prompt=_build_qoder_prompt(config),
@@ -444,13 +457,13 @@ async def stream_qoder_analysis(config: QoderAnalysisConfig) -> AsyncGenerator[A
                         )
                         continue
                     raise
+            if last_exc is not None:
+                raise last_exc
+            if result_message is None:
+                raise RuntimeError("Qoder 会话未返回结果消息")
+            report, metadata = _finish_qoder_result(result_message, config, cache_key, repository_head, assistant_texts)
         finally:
             log_handle.close()
-        if last_exc is not None:
-            raise last_exc
-        if result_message is None:
-            raise RuntimeError("Qoder 会话未返回结果消息")
-        report, metadata = _finish_qoder_result(result_message, config, cache_key, repository_head, assistant_texts)
     except Exception as exc:  # noqa: BLE001
         stderr_tail = _read_stderr_tail()
         detail = f"分析过程中出错: {exc}"

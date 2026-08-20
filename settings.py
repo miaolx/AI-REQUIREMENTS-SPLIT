@@ -10,8 +10,10 @@ CODEX_MODEL: str | None = None
 CODEX_REASONING_EFFORT = "low"
 # Qoder 影响分析默认 skill（位于 ~/.qoder/skills/<名称>/SKILL.md）
 QODER_SKILL_NAME = "requirement-impact-analysis"
-# Qoder 模型 ID；None 表示使用 Qoder 默认模型
-QODER_MODEL: str | None = None
+# Qoder 模型 ID；可直接在下方引号内填写固定模型（如 "auto" 或具体模型 ID），
+# 也可用环境变量 QODER_MODEL 覆盖；两者均为空时使用 Qoder 默认模型
+_QODER_MODEL_FIXED = "GLM-5.3"
+QODER_MODEL: str | None = os.environ.get("QODER_MODEL", "") or _QODER_MODEL_FIXED or None
 # Qoder 个人访问令牌（https://qoder.com/account/integrations 生成）；
 # 可直接在下方引号内填写固定值，也可用环境变量 QODER_PERSONAL_ACCESS_TOKEN 覆盖；
 # 两者均为空时回退本机 Qoder CLI 登录态（~/.qoder/.auth）

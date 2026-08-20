@@ -34,7 +34,7 @@ REQUIRED_PROJECT_BRANCH = "dev"
 class AnalyzeRequest(BaseModel):
     """影响范围分析请求。"""
 
-    requirement_html_path: str = Field(..., description="本地需求产品文档 HTML 绝对路径")
+    requirement_html_path: str = Field(..., description="本地需求产品文档绝对路径，支持 .html/.htm/.md")
     prototype_image: str | None = Field(
         default=None,
         description="原型图本地绝对路径或 http/https URL；URL 会先下载到临时文件",
@@ -80,7 +80,7 @@ class QoderAnalyzeRequest(BaseModel):
     )
     requirement_html_path: str | None = Field(
         default=None,
-        description="可选：本地需求产品文档 HTML 绝对路径",
+        description="可选：本地需求产品文档绝对路径，支持 .html/.htm/.md",
     )
     skill_name: str = Field(
         default=DEFAULT_QODER_SKILL_NAME,
@@ -211,15 +211,15 @@ def _resolve_local_dev_repository(project: Path) -> Path:
 
 
 def _validate_request(req: AnalyzeRequest) -> tuple[str, str]:
-    """校验需求 HTML，并将项目限制为本地 dev 分支仓库。"""
+    """校验需求文档（HTML/Markdown），并将项目限制为本地 dev 分支仓库。"""
     requirement = Path(req.requirement_html_path).expanduser()
     if not requirement.is_absolute():
         raise HTTPException(status_code=400, detail="requirement_html_path 必须是绝对路径")
     requirement = requirement.resolve()
     if not requirement.is_file():
-        raise HTTPException(status_code=400, detail=f"需求 HTML 不存在: {requirement}")
-    if requirement.suffix.lower() not in {".html", ".htm"}:
-        raise HTTPException(status_code=400, detail="requirement_html_path 必须指向 .html 或 .htm 文件")
+        raise HTTPException(status_code=400, detail=f"需求文档不存在: {requirement}")
+    if requirement.suffix.lower() not in {".html", ".htm", ".md", ".markdown"}:
+        raise HTTPException(status_code=400, detail="requirement_html_path 必须指向 .html/.htm/.md 文件")
 
     project = Path(req.project_path).expanduser()
     if not project.is_absolute():
@@ -344,7 +344,7 @@ async def analyze_stream(
 
 
 def _validate_qoder_request(req: QoderAnalyzeRequest) -> tuple[str | None, str]:
-    """校验可选需求 HTML，并将项目限制为本地 dev 分支仓库。"""
+    """校验可选需求文档（HTML/Markdown），并将项目限制为本地 dev 分支仓库。"""
     requirement: str | None = None
     if req.requirement_html_path:
         candidate = Path(req.requirement_html_path).expanduser()
@@ -352,9 +352,9 @@ def _validate_qoder_request(req: QoderAnalyzeRequest) -> tuple[str | None, str]:
             raise HTTPException(status_code=400, detail="requirement_html_path 必须是绝对路径")
         candidate = candidate.resolve()
         if not candidate.is_file():
-            raise HTTPException(status_code=400, detail=f"需求 HTML 不存在: {candidate}")
-        if candidate.suffix.lower() not in {".html", ".htm"}:
-            raise HTTPException(status_code=400, detail="requirement_html_path 必须指向 .html 或 .htm 文件")
+            raise HTTPException(status_code=400, detail=f"需求文档不存在: {candidate}")
+        if candidate.suffix.lower() not in {".html", ".htm", ".md", ".markdown"}:
+            raise HTTPException(status_code=400, detail="requirement_html_path 必须指向 .html/.htm/.md 文件")
         requirement = str(candidate)
 
     project = Path(req.project_path).expanduser()
